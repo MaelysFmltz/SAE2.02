@@ -1,0 +1,377 @@
+#include <PubSubClient.h>
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <ESP32_VS1053_Stream.h>
+
+// Broches utilisées pour le VS1053 à ne pas changer !
+#define VS1053_CS     32
+#define VS1053_DCS    33
+#define VS1053_DREQ   15
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+uint8_t spatialMode = 0; // 0=off, 1=low, 2=medium, 3=high
+
+// Création de l'objet player
+ESP32_VS1053_Stream player;
+
+// Liste des stations radio (URLs complètes)
+const char* stations[] = {
+  "http://live.radioking.fr/azur-fm-68",
+  "http://ice4.somafm.com/seventies-128-mp3",
+  "https://florfm.ice.infomaniak.ch/webmulhouse.mp3",
+  "http://lbs-th2-2.nrjaudio.fm/fr/30601/mp3_128.mp3",
+  "http://radios.rtbf.be/wr-c21-metal-128.mp3",
+  "http://ecoutez.chyz.ca:8000/mp3",
+  "http://lyon1ere.ice.infomaniak.ch/lyon1ere-high.mp3"
+};
+#define NOMBRECHAINES (sizeof(stations)/sizeof(stations[0]))
+int chaine = 0;
+
+// Paramètres audio
+int volume = 85;         // 0 à 100
+int8_t trebleAmp = 0;    // -8 à +7
+uint8_t trebleFreq = 8;  // 1 à 15 (en kHz, voir datasheet VS1053)
+uint8_t bassAmp = 7;     // 0 à 15
+uint8_t bassFreq = 8;    // 1 à 15 (en dizaines de Hz)
+int volumeAvantMute = 85; // Pour mémoriser le volume avant mute
+bool isMuted = false;     // Pour savoir si on est en mode mute ou pas
+
+
+// Valeurs par défaut (milieu)
+const int8_t DEFAULT_TREBLE_AMP = 0;
+const uint8_t DEFAULT_TREBLE_FREQ = 8;
+const uint8_t DEFAULT_BASS_AMP = 7;
+const uint8_t DEFAULT_BASS_FREQ = 8;
+
+// Appliquer basses/aigus via registre SCI_BASS
+void applyBassTreble() {
+  uint16_t value = ((uint16_t)(trebleAmp & 0x0F) << 12) //(bits 12 à 15) → on décale de 12 cases vers la gauche
+                 | ((uint16_t)(trebleFreq & 0x0F) << 8)//bits 8 à 11) → on décale de 8 cases
+                 | ((uint16_t)(bassAmp & 0x0F) << 4)//(bits 4 à 7) → on décale de 4 cases
+                 | (bassFreq & 0x0F);//(bits 0 à 3) → pas besoin de décaler
+
+  player.writeCodecRegister(0x02, value);// SCI_BASS = 0x02
+  Serial.println(value, BIN);
+  Serial.print("TrebleAmp: "); Serial.print(trebleAmp);
+  Serial.print(" TrebleFreq: "); Serial.print(trebleFreq);
+  Serial.print(" BassAmp: "); Serial.print(bassAmp);
+  Serial.print(" BassFreq: "); Serial.println(bassFreq);
+}
+
+// --- Fonction de spatialisation la plus simple possible ---
+//00 = OFF; 01 = MIN; 10 = NORMAL; 11 = EXTREME (sur 16bits)
+//Ne pas modifier les autres bits (Masquage) que le 7 et 4
+void setSpatialization(uint8_t mode) {
+    // 1. Lire le registre SCI_MODE
+    uint16_t valeur = player.readCodecRegister(0x00);
+
+    // 2. Masquage pour effacer bits 4 et 7 (1111111101101111)
+    // (soit ~((1 << 4) | (1 << 7)) = 0b1111111101101111 = 0xFF6F)
+    valeur = valeur & 0b1111111101101111;
+
+    // 3. Appliquer le mode (00 = OFF, 01 = LOW, 10 = MEDIUM, 11 = HIGH)
+    if (mode == 1) { // LOW : bit 4 à 1
+        valeur = valeur | (1 << 4); // 0000000000010000
+    } else if (mode == 2) { // MEDIUM : bit 7 à 1
+        valeur = valeur | (1 << 7); // 0000000010000000
+    } else if (mode == 3) { // HIGH : bits 4 et 7 à 1
+        valeur = valeur | (1 << 4); // 0000000000010000
+        valeur = valeur | (1 << 7); // 0000000010000000
+    }
+    // mode == 0 : OFF, on laisse les bits à 0
+
+    // 4. Écrire la nouvelle valeur dans le registre SCI_MODE
+    player.writeCodecRegister(0x00, valeur);
+
+    // Affichage pour contrôle
+    Serial.print("SCI_MODE = ");
+    Serial.println(valeur, BIN);
+    Serial.print("Spatialisation mode (EarSpeaker) : ");
+    Serial.println(mode % 4);
+}
+
+
+// MQTT
+const char* mqtt_server = "test.mosquitto.org";
+const int mqtt_port = 1883;
+
+ // Prototypes
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+void reconnectMQTT();
+void applyBassTreble();
+void setSpatialization(uint8_t mode);
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) { //topic : le nom du canal ; payload : le contenu du message ; length : la taille du message reçu
+
+  String msg; // contre erreur de lecture
+  for (unsigned int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+  msg.trim();
+
+  Serial.print("Message MQTT reçu: ");
+  Serial.println(msg);
+
+  // Changement de chaîne
+  if (msg == "n") {
+    chaine = (chaine + 1) % NOMBRECHAINES;
+    player.stopSong();
+    player.connecttohost(stations[chaine]);
+  }
+  else if (msg == "v") {
+    chaine = (chaine - 1 + NOMBRECHAINES) % NOMBRECHAINES;
+    player.stopSong();
+    player.connecttohost(stations[chaine]);
+  }
+  // Volume +
+  else if (msg == "+") {
+    if (volume < 100) volume++;
+    player.setVolume(volume);
+  }
+  // Volume -
+  else if (msg == "-") {
+    if (volume > 0) volume--;
+    player.setVolume(volume);
+  }
+  // Basses +
+  else if (msg == "g") {
+    if (bassAmp < 15) {
+      bassAmp++;
+      applyBassTreble();
+    }
+  }
+  // Basses -
+  else if (msg == "f") {
+    if (bassAmp > 0) {
+      bassAmp--;
+      applyBassTreble();
+    }
+  }
+  // Aigus +
+  else if (msg == "j") {
+    if (trebleAmp < 7) {
+      trebleAmp++;
+      applyBassTreble();
+    }
+  }
+  // Aigus -
+  else if (msg == "h") {
+    if (trebleAmp > -8) {
+      trebleAmp--;
+      applyBassTreble();
+    }
+  }
+  // Spatialisation (cycle)
+  else if (msg == "s") {
+    spatialMode = (spatialMode + 1) % 4;
+    setSpatialization(spatialMode);
+  }
+  // Tonalité par défaut
+  else if (msg == "d") {
+    trebleAmp = DEFAULT_TREBLE_AMP;
+    trebleFreq = DEFAULT_TREBLE_FREQ;
+    bassAmp = DEFAULT_BASS_AMP;
+    bassFreq = DEFAULT_BASS_FREQ;
+    applyBassTreble();
+  }
+  // Changement de station par numéro(bonus)
+  else if (msg.startsWith("station:")) {
+    int newChaine = msg.substring(8).toInt();
+    if (newChaine >= 0 && newChaine < NOMBRECHAINES) {
+      chaine = newChaine;
+      player.stopSong();
+      player.connecttohost(stations[chaine]);
+    }
+  }
+  // Changement de station par URL
+  else if (msg.startsWith("http://") || msg.startsWith("https://")) {
+  // Si le message commence directement par http:// ou https://, c'est une URL
+    player.stopSong();
+    player.connecttohost(msg.c_str());
+}
+  // Mute (coupure du son)
+  if (msg == "mute") {
+    if (!isMuted) {
+      volumeAvantMute = volume; // Sauvegarde le volume actuel
+      volume = 0;
+      player.setVolume(volume);
+      isMuted = true;
+    } else {
+      // Si déjà mute, on remet le volume d'avant
+      volume = volumeAvantMute;
+      player.setVolume(volume);
+      isMuted = false;
+    }
+  }
+  else if (msg == "default") {
+    chaine = 0; // ou le numéro de ta station par défaut
+    player.stopSong();
+    player.connecttohost(stations[chaine]);
+  }
+  else if (msg.startsWith("url:")) {
+    String url = msg.substring(4);
+    player.stopSong();
+    player.connecttohost(url.c_str());
+  } 
+}
+
+
+
+// --- Setup ---
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n\nRadio WiFi");
+  Serial.println("Controles: ");
+  Serial.println("\t n: station suivante");
+  Serial.println("\t v: station precedente");
+  Serial.println("\t + / -: volume");
+  Serial.println("\t g/f: basses");
+  Serial.println("\t j/h: aigus");
+  Serial.println("\t d: tonalité par défaut");
+  Serial.println("\t s: spatialisation");
+
+  // Connexion WiFi
+  WiFiManager wifiManager;
+  if(!wifiManager.autoConnect("WebRadio-ConfigMaelys-Ethan")) {
+    Serial.println("Echec de connexion, redémarrage...");
+    delay(3000);
+    ESP.restart();
+  }
+  Serial.println("WiFi connecté !");
+  Serial.print("Adresse IP: ");
+  Serial.println(WiFi.localIP());
+
+  // MQTT
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(mqttCallback);
+  client.subscribe("webradio/maelysethan/changement");
+  
+
+  
+
+  // VS1053
+  SPI.begin();
+  player.startDecoder(VS1053_CS, VS1053_DCS, VS1053_DREQ);
+  player.setVolume(volume);
+  applyBassTreble();
+  setSpatialization(spatialMode);
+
+  Serial.print("Connexion à la station : ");
+  Serial.println(stations[chaine]);
+  player.connecttohost(stations[chaine]);
+
+}
+void reconnectMQTT() {
+  while (!client.connected()) {
+    Serial.print("Connexion au broker MQTT...");
+    String clientId = "ESP32WebRadio-" + String(random(0xffff), HEX);
+    if (client.connect(clientId.c_str())) {
+      Serial.println("connecté !");
+      client.subscribe("webradio/maelysethan/changement");
+    } else {
+      Serial.print("Échec, rc=");
+      Serial.print(client.state());
+      Serial.println(" nouvelle tentative dans 5s...");
+      delay(5000);
+    }
+  }
+}
+
+// --- Loop ---
+void loop() {
+  if (!client.connected()) {
+    reconnectMQTT();
+  }
+  client.loop();
+
+  player.loop();
+
+  if (Serial.available()) {
+    char c = Serial.read();
+
+    // Changement de station
+    if (c == 'n') {
+      chaine = (chaine + 1) % NOMBRECHAINES;
+      player.stopSong();
+      Serial.print("Station suivante : ");
+      Serial.println(stations[chaine]);
+      delay(200);
+      player.connecttohost(stations[chaine]);
+    }
+    else if (c == 'v') {
+      chaine = (chaine - 1 + NOMBRECHAINES) % NOMBRECHAINES;
+      player.stopSong();
+      Serial.print("Station précédente : ");
+      Serial.println(stations[chaine]);
+      delay(200);
+      player.connecttohost(stations[chaine]);
+    }
+    else if (c == '+') {
+      if (volume < 100) volume++;
+      player.setVolume(volume);
+      Serial.print("Volume : ");
+      Serial.println(volume);
+    }
+    else if (c == '-') {
+      if (volume > 0) volume--;
+      player.setVolume(volume);
+      Serial.print("Volume : ");
+      Serial.println(volume);
+    }
+    else if (c == 'g') {
+      if (bassAmp < 15) {
+        bassAmp++;
+        Serial.print("Basses plus fortes : ");
+        Serial.println(bassAmp);
+        applyBassTreble();
+      } else {
+        Serial.println("Basses déjà au maximum !");
+      }
+    }
+    else if (c == 'f') {
+      if (bassAmp > 0) {
+        bassAmp--;
+        Serial.print("Basses moins fortes : ");
+        Serial.println(bassAmp);
+        applyBassTreble();
+      } else {
+        Serial.println("Basses déjà au minimum !");
+      }
+    }
+    else if (c == 'j') {
+      if (trebleAmp < 7) {
+        trebleAmp++;
+        Serial.print("Aigus plus forts : ");
+        Serial.println(trebleAmp);
+        applyBassTreble();
+      } else {
+        Serial.println("Aigus déjà au maximum !");
+      }
+    }
+    else if (c == 'h') {
+      if (trebleAmp > -8) {
+        trebleAmp--;
+        Serial.print("Aigus moins forts : ");
+        Serial.println(trebleAmp);
+        applyBassTreble();
+      } else {
+        Serial.println("Aigus déjà au minimum !");
+      }
+    }
+    else if (c == 's') {
+      spatialMode = (spatialMode + 1) % 4;
+      setSpatialization(spatialMode);
+    }
+    else if (c == 'd') {
+      trebleAmp = DEFAULT_TREBLE_AMP;
+      trebleFreq = DEFAULT_TREBLE_FREQ;
+      bassAmp = DEFAULT_BASS_AMP;
+      bassFreq = DEFAULT_BASS_FREQ;
+      Serial.println("Tonalité réinitialisée aux valeurs par défaut !");
+      applyBassTreble();
+    }
+    
+  }
+}
